@@ -15,6 +15,7 @@ from torch.utils.data import DataLoader
 from .samplers import (ClassAwareSampler, DistributedGroupSampler,
                        DistributedSampler, GroupSampler, InfiniteBatchSampler,
                        InfiniteGroupBatchSampler)
+from . import samplers
 
 if platform.system() != 'Windows':
     # https://github.com/pytorch/pytorch/issues/973
@@ -94,6 +95,8 @@ def build_dataloader(dataset,
                      runner_type='EpochBasedRunner',
                      persistent_workers=False,
                      class_aware_sampler=None,
+                     custom_sampler_cfg=None, 
+                     custom_batch_sampler_cfg=None,
                      **kwargs):
     """Build PyTorch DataLoader.
 
@@ -118,6 +121,14 @@ def build_dataloader(dataset,
             This argument is only valid when PyTorch>=1.7.0. Default: False.
         class_aware_sampler (dict): Whether to use `ClassAwareSampler`
             during training. Default: None.
+        custom_sampler_cfg (dict, optional): Use the specified
+            custimized sampler to override others. The argument offers more
+            flexibility, allowing users to define their own samplers if not 
+            implemented yet. Default: None. 
+        custom_batch_sampler_cfg (dict, optional): Use the specified
+            custimized batch sampler to override others. The argument offers more
+            flexibility, allowing users to define their own batch samplers if not 
+            implemented yet. Default: None. 
         kwargs: any keyword argument to be used to initialize DataLoader
 
     Returns:
@@ -136,50 +147,85 @@ def build_dataloader(dataset,
         # the batch size is samples on all the GPUS
         batch_size = num_gpus * samples_per_gpu
         num_workers = num_gpus * workers_per_gpu
-
-    if runner_type == 'IterBasedRunner':
-        # this is a batch sampler, which can yield
-        # a mini-batch indices each time.
-        # it can be used in both `DataParallel` and
-        # `DistributedDataParallel`
-        if shuffle:
-            batch_sampler = InfiniteGroupBatchSampler(
-                dataset, batch_size, world_size, rank, seed=seed)
+    
+    if custom_sampler_cfg is None and custom_batch_sampler_cfg is None:
+        if runner_type == 'IterBasedRunner':
+            # this is a batch sampler, which can yield
+            # a mini-batch indices each time.
+            # it can be used in both `DataParallel` and
+            # `DistributedDataParallel`
+            if shuffle:
+                batch_sampler = InfiniteGroupBatchSampler(
+                    dataset, batch_size, world_size, rank, seed=seed)
+            else:
+                batch_sampler = InfiniteBatchSampler(
+                    dataset,
+                    batch_size,
+                    world_size,
+                    rank,
+                    seed=seed,
+                    shuffle=False)
+            batch_size = 1
+            sampler = None
         else:
-            batch_sampler = InfiniteBatchSampler(
-                dataset,
-                batch_size,
-                world_size,
-                rank,
-                seed=seed,
-                shuffle=False)
+            if class_aware_sampler is not None:
+                # ClassAwareSampler can be used in both distributed and
+                # non-distributed training.
+                num_sample_class = class_aware_sampler.get('num_sample_class', 1)
+                sampler = ClassAwareSampler(
+                    dataset,
+                    samples_per_gpu,
+                    world_size,
+                    rank,
+                    seed=seed,
+                    num_sample_class=num_sample_class)
+            elif dist:
+                # DistributedGroupSampler will definitely shuffle the data to
+                # satisfy that images on each GPU are in the same group
+                if shuffle:
+                    sampler = DistributedGroupSampler(
+                        dataset, samples_per_gpu, world_size, rank, seed=seed)
+                else:
+                    sampler = DistributedSampler(
+                        dataset, world_size, rank, shuffle=False, seed=seed)
+            else:
+                sampler = GroupSampler(dataset,
+                                    samples_per_gpu) if shuffle else None
+            batch_sampler = None
+
+    elif custom_sampler_cfg is not None and custom_batch_sampler_cfg is not None:
+        raise ValueError("custom_sampler and custom_batch_sampler are mutually exclusive")
+
+    elif custom_sampler_cfg is not None:
+        # use customized sampler or customized batch sampler to override
+        assert "type" in custom_sampler_cfg, "sampler type not specified"
+        sampler_t = custom_sampler_cfg.pop("type")
+        assert sampler_t in samplers.__all__, f"{sampler_t} not implemented in {samplers.__name__}"
+        
+        if "shuffle" not in custom_sampler_cfg:
+            custom_sampler_cfg["shuffle"] = shuffle
+        
+        custom_sampler_cfg["seed"] = seed
+        # sampler class must accept `dataset` as its argument
+        sampler = getattr(samplers, sampler_t)(dataset=dataset, **custom_sampler_cfg)
+
+        batch_sampler = None
+
+    else:
+        assert "type" in custom_batch_sampler_cfg, "batch sampler type not specified"
+        batch_sampler_t = custom_batch_sampler_cfg.pop("type")
+        assert batch_sampler_t in samplers.__all__, f"{batch_sampler_t} not implemented in {samplers.__name__}"
+
+        if "shuffle" not in custom_batch_sampler_cfg:
+            custom_batch_sampler_cfg["shuffle"] = shuffle
+        
+        custom_batch_sampler_cfg["seed"] = seed
+        # batch sampler class must accept `dataset` as its argument
+        batch_sampler = getattr(samplers, batch_sampler_t)(dataset=dataset, **custom_batch_sampler_cfg)
+
         batch_size = 1
         sampler = None
-    else:
-        if class_aware_sampler is not None:
-            # ClassAwareSampler can be used in both distributed and
-            # non-distributed training.
-            num_sample_class = class_aware_sampler.get('num_sample_class', 1)
-            sampler = ClassAwareSampler(
-                dataset,
-                samples_per_gpu,
-                world_size,
-                rank,
-                seed=seed,
-                num_sample_class=num_sample_class)
-        elif dist:
-            # DistributedGroupSampler will definitely shuffle the data to
-            # satisfy that images on each GPU are in the same group
-            if shuffle:
-                sampler = DistributedGroupSampler(
-                    dataset, samples_per_gpu, world_size, rank, seed=seed)
-            else:
-                sampler = DistributedSampler(
-                    dataset, world_size, rank, shuffle=False, seed=seed)
-        else:
-            sampler = GroupSampler(dataset,
-                                   samples_per_gpu) if shuffle else None
-        batch_sampler = None
+            
 
     init_fn = partial(
         worker_init_fn, num_workers=num_workers, rank=rank,
